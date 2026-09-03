@@ -48,6 +48,7 @@ However, please remember to manually clone `glm` library via:
 ```shell
 cd submodules/diff-gaussian-rasterization/third_party
 git clone https://github.com/g-truc/glm.git
+cd glm
 git checkout 5c46b9c
 ```
 
@@ -57,8 +58,11 @@ git checkout 5c46b9c
 Running our code requires the following packages:
 
 ```shell
-pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu116
-conda install nvidia/label/cuda-11.8.0::cuda # optional, for nvcc toolkits
+conda create -y -n SteepGS python=3.8
+conda activate SteepGS
+# 原项目使用 torch 1.12.1+cu116
+pip install torch==2.0.0 torchvision==0.15.1 torchaudio==2.0.1 --index-url https://download.pytorch.org/whl/cu118
+pip install tqdm plyfile opencv-python-headless ninja
 ```
 
 You also need to install two customized packages `diff-gaussian-rasterization` and `simple-knn`:

@@ -254,7 +254,145 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            ply_path=ply_path)
     return scene_info
 
+def _read_omniscene_cameras(path, transformsfile):
+    """Read prepared OmniScene cameras without Blender/OpenGL axis conversion."""
+    transforms_path = os.path.join(path, transformsfile)
+    with open(transforms_path, "r", encoding="utf-8") as transforms_file:
+        contents = json.load(transforms_file)
+    if contents.get("coordinate_convention") != "opencv_camera_to_keyframe_lidar_world":
+        raise ValueError("Unsupported OmniScene coordinate convention in {}".format(transforms_path))
+    if contents.get("no_flip_yz") is not True:
+        raise ValueError("OmniScene transforms must explicitly set no_flip_yz=true")
+
+    frames = contents.get("frames")
+    if not isinstance(frames, list):
+        raise ValueError("OmniScene transforms must contain a frame list: {}".format(transforms_path))
+    cam_infos = []
+    view_ids = []
+    scene_root = os.path.realpath(path)
+    for idx, frame in enumerate(frames):
+        view_id = frame.get("view_id")
+        if not isinstance(view_id, str) or not view_id:
+            raise ValueError("OmniScene frame {} has no stable view_id".format(idx))
+        view_ids.append(view_id)
+
+        relative_path = frame.get("file_path")
+        if not isinstance(relative_path, str):
+            raise ValueError("OmniScene frame {} has no file_path".format(view_id))
+        image_path = os.path.realpath(os.path.join(scene_root, relative_path))
+        if os.path.commonpath([scene_root, image_path]) != scene_root:
+            raise ValueError("OmniScene image path escapes scene root: {}".format(relative_path))
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError("OmniScene image does not exist: {}".format(image_path))
+        with Image.open(image_path) as image_file:
+            image = image_file.convert("RGB").copy()
+        width, height = image.size
+        if frame.get("width") != width or frame.get("height") != height:
+            raise ValueError("Image dimensions differ from frame metadata: {}".format(view_id))
+
+        try:
+            fx = float(frame["fl_x"])
+            fy = float(frame["fl_y"])
+            cx = float(frame["cx"])
+            cy = float(frame["cy"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Invalid per-frame intrinsics: {}".format(view_id)) from exc
+        if not np.isfinite([fx, fy, cx, cy]).all() or fx <= 0 or fy <= 0:
+            raise ValueError("Non-finite or non-positive intrinsics: {}".format(view_id))
+        if abs(cx - width / 2.0) > 1e-4 or abs(cy - height / 2.0) > 1e-4:
+            raise ValueError(
+                "SteepGS symmetric projection requires a centered principal point: {} "
+                "has ({}, {}) for {}x{}".format(view_id, cx, cy, width, height)
+            )
+
+        c2w = np.asarray(frame.get("transform_matrix"), dtype=np.float64)
+        if c2w.shape != (4, 4) or not np.isfinite(c2w).all():
+            raise ValueError("Invalid finite 4x4 c2w: {}".format(view_id))
+        if not np.allclose(c2w[3], [0.0, 0.0, 0.0, 1.0], atol=1e-7):
+            raise ValueError("Invalid homogeneous c2w bottom row: {}".format(view_id))
+        rotation = c2w[:3, :3]
+        if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
+            raise ValueError("Non-orthogonal c2w rotation: {}".format(view_id))
+        if np.linalg.det(rotation) <= 0.0:
+            raise ValueError("Non-positive c2w rotation determinant: {}".format(view_id))
+
+        # The source pose already uses OpenCV camera axes.  Do not apply the
+        # Blender reader's c2w[:3, 1:3] *= -1 conversion here.
+        w2c = np.linalg.inv(c2w)
+        R = np.transpose(w2c[:3, :3])
+        T = w2c[:3, 3]
+        cam_infos.append(
+            CameraInfo(
+                uid=idx,
+                R=R,
+                T=T,
+                FovY=focal2fov(fy, height),
+                FovX=focal2fov(fx, width),
+                image=image,
+                image_path=image_path,
+                image_name=view_id,
+                width=width,
+                height=height,
+            )
+        )
+    if len(set(view_ids)) != len(view_ids):
+        raise ValueError("Duplicate OmniScene view_id in {}".format(transforms_path))
+    return cam_infos
+
+
+def readOmniSceneInfo(path, white_background, eval):
+    """Load one strict 6-context/18-target prepared OmniScene scene."""
+    del white_background
+    if not eval:
+        raise ValueError("OmniScene target views must remain evaluation-only; pass --eval")
+    manifest_path = os.path.join(path, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError("OmniScene manifest is required: {}".format(manifest_path))
+    with open(manifest_path, "r", encoding="utf-8") as manifest_file:
+        manifest = json.load(manifest_file)
+    if manifest.get("context_view_count") != 6 or manifest.get("target_view_count") != 18:
+        raise ValueError("OmniScene manifest must declare exactly 6 train and 18 test views")
+
+    print("Reading OmniScene Training Transforms")
+    train_cam_infos = _read_omniscene_cameras(path, "transforms_train.json")
+    print("Reading OmniScene Test Transforms")
+    test_cam_infos = _read_omniscene_cameras(path, "transforms_test.json")
+    if len(train_cam_infos) != 6 or len(test_cam_infos) != 18:
+        raise ValueError(
+            "OmniScene scene requires exactly 6 train and 18 test cameras; got {}/{}".format(
+                len(train_cam_infos), len(test_cam_infos)
+            )
+        )
+    expected_train_ids = manifest.get("context_view_ids")
+    expected_test_ids = manifest.get("target_view_ids")
+    if expected_train_ids != [camera.image_name for camera in train_cam_infos]:
+        raise ValueError("Training view order differs from OmniScene manifest")
+    if expected_test_ids != [camera.image_name for camera in test_cam_infos]:
+        raise ValueError("Test view order differs from OmniScene manifest")
+
+    ply_path = os.path.join(path, "points3D.ply")
+    if not os.path.isfile(ply_path):
+        raise FileNotFoundError(
+            "Metric-depth points3D.ply is required; random initialization is disabled: {}".format(
+                ply_path
+            )
+        )
+    pcd = fetchPly(ply_path)
+    if pcd is None or len(pcd.points) == 0:
+        raise ValueError("OmniScene initialization point cloud is empty: {}".format(ply_path))
+    if not np.isfinite(pcd.points).all() or not np.isfinite(pcd.colors).all():
+        raise ValueError("OmniScene initialization point cloud contains non-finite values")
+
+    return SceneInfo(
+        point_cloud=pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        nerf_normalization=getNerfppNorm(train_cam_infos),
+        ply_path=ply_path,
+    )
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
-    "Blender" : readNerfSyntheticInfo
+    "Blender" : readNerfSyntheticInfo,
+    "OmniScene": readOmniSceneInfo,
 }

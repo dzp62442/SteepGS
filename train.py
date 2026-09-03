@@ -11,6 +11,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import os
+import hashlib
+import json
+import random
+import time
+import numpy as np
 import torch
 import torchvision
 from random import randint
@@ -30,12 +35,37 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_iterations, checkpoint_iterations, vis_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_iterations, checkpoint_iterations, vis_iterations, checkpoint, debug_from, omniscene_protocol=False):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
+    omniscene_evaluator = None
+    pure_training_seconds = 0.0
+    omniscene_view_sequence = hashlib.sha256()
+    omniscene_milestone_counts = {}
+    if omniscene_protocol:
+        if not os.path.isfile(os.path.join(dataset.source_path, "manifest.json")):
+            raise ValueError("--omniscene_protocol requires a prepared OmniScene source directory")
+        if checkpoint is not None or checkpoint_iterations:
+            raise ValueError("OmniScene protocol forbids sample checkpoints and checkpoint restore")
+        if len(scene.getTrainCameras()) != 6 or len(scene.getTestCameras()) != 18:
+            raise ValueError("OmniScene protocol requires exactly 6 train and 18 test cameras")
+        if set(saving_iterations) != {opt.iterations}:
+            raise ValueError("OmniScene protocol only permits the final point-cloud save")
+        if not testing_iterations or sorted(set(testing_iterations)) != list(testing_iterations):
+            raise ValueError("OmniScene test iterations must be non-empty, unique, and increasing")
+        if testing_iterations[-1] != opt.iterations:
+            raise ValueError("The final OmniScene evaluation must equal --iterations")
+        from comp_svfgs.omniscene_evaluation import OmniSceneEvaluator
+        omniscene_evaluator = OmniSceneEvaluator(
+            dataset.model_path, scene, render, (pipe, torch.tensor(
+                [1, 1, 1] if dataset.white_background else [0, 0, 0],
+                dtype=torch.float32,
+                device="cuda",
+            ))
+        )
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -69,6 +99,9 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
                 except Exception as e:
                     network_gui.conn = None
 
+        if omniscene_protocol:
+            torch.cuda.synchronize()
+            pure_segment_start = time.perf_counter()
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
@@ -98,6 +131,12 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
         loss.backward()
 
         iter_end.record()
+        if omniscene_protocol:
+            torch.cuda.synchronize()
+            pure_training_seconds += time.perf_counter() - pure_segment_start
+            omniscene_view_sequence.update(
+                "{}:{}\n".format(iteration, viewpoint_cam.image_name).encode("utf-8")
+            )
 
         with torch.no_grad():
             # Progress bar
@@ -109,10 +148,26 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
                 progress_bar.close()
 
             # Log and save
-            training_report(dataset, tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), logging_intervals, testing_iterations, scene, render, (pipe, background))
+            training_report(dataset, tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), logging_intervals, [] if omniscene_protocol else testing_iterations, scene, render, (pipe, background))
+            if omniscene_protocol and iteration in testing_iterations:
+                omniscene_milestone_counts[str(iteration)] = int(gaussians.get_xyz.shape[0])
+                metrics = omniscene_evaluator.evaluate(iteration, pure_training_seconds)
+                print(
+                    "\n[ITER {}] OmniScene all-18: PSNR {:.7f} SSIM {:.7f} LPIPS {:.7f} TRAIN_TIME {:.3f}s".format(
+                        iteration,
+                        metrics["all_18"]["psnr"],
+                        metrics["all_18"]["ssim"],
+                        metrics["all_18"]["lpips"],
+                        pure_training_seconds,
+                    )
+                )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+
+            if omniscene_protocol:
+                torch.cuda.synchronize()
+                pure_segment_start = time.perf_counter()
 
             # Densification
             if iteration < opt.densify_until_iter: # or gaussians.get_xyz.shape[0] < 6000000:
@@ -188,7 +243,13 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
 
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
                     densify_info = gaussians.densify_and_prune(opt.densify_strategy, opt.densify_grad_threshold, opt.densify_S_threshold, 0.005, scene.cameras_extent, size_threshold)
+                    if omniscene_protocol:
+                        torch.cuda.synchronize()
+                        pure_training_seconds += time.perf_counter() - pure_segment_start
                     write_dict_log(dataset, {'iteration': iteration, **densify_info})
+                    if omniscene_protocol:
+                        torch.cuda.synchronize()
+                        pure_segment_start = time.perf_counter()
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -201,6 +262,27 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+            if omniscene_protocol:
+                torch.cuda.synchronize()
+                pure_training_seconds += time.perf_counter() - pure_segment_start
+
+    if omniscene_protocol:
+        trace = {
+            "schema_version": 1,
+            "iterations": int(opt.iterations),
+            "selection_count": int(opt.iterations - first_iter + 1),
+            "view_sequence_sha256": omniscene_view_sequence.hexdigest(),
+            "gaussian_count_at_milestones": omniscene_milestone_counts,
+            "gaussian_count_after_loop": int(gaussians.get_xyz.shape[0]),
+        }
+        trace_path = os.path.join(scene.model_path, "omniscene_training_trace.json")
+        temporary_trace_path = trace_path + ".tmp"
+        with open(temporary_trace_path, "w", encoding="utf-8") as trace_file:
+            json.dump(trace, trace_file, indent=2, allow_nan=False)
+            trace_file.write("\n")
+            trace_file.flush()
+            os.fsync(trace_file.fileno())
+        os.replace(temporary_trace_path, trace_path)
 
 def prepare_output_and_logger(args):    
     if not args.model_path:
@@ -304,6 +386,8 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--omniscene_protocol", action="store_true", default=False)
+    parser.add_argument("--training_seed", type=int, default=0)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -311,13 +395,18 @@ if __name__ == "__main__":
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
+    random.seed(args.training_seed)
+    np.random.seed(args.training_seed)
+    torch.manual_seed(args.training_seed)
+    torch.cuda.manual_seed_all(args.training_seed)
+    torch.backends.cudnn.benchmark = False
 
     # Start GUI server, configure and run training
     network_gui.disabled = args.no_gui
     if not network_gui.disabled:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.logging_intervals, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.vis_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.logging_intervals, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.vis_iterations, args.start_checkpoint, args.debug_from, args.omniscene_protocol)
 
     # All done
     print("\nTraining complete.")

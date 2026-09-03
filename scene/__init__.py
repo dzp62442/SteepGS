@@ -40,7 +40,26 @@ class Scene:
         self.train_cameras = {}
         self.test_cameras = {}
 
-        if os.path.exists(os.path.join(args.source_path, "sparse")):
+        manifest_path = os.path.join(args.source_path, "manifest.json")
+        transforms_path = os.path.join(args.source_path, "transforms_train.json")
+        is_omniscene = False
+        for metadata_path in (manifest_path, transforms_path):
+            if not os.path.isfile(metadata_path):
+                continue
+            try:
+                with open(metadata_path, "r", encoding="utf-8") as metadata_file:
+                    metadata = json.load(metadata_file)
+                if metadata.get("coordinate_convention") == "opencv_camera_to_keyframe_lidar_world":
+                    is_omniscene = True
+                    break
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+        if is_omniscene:
+            print("Found OmniScene manifest, using the strict OpenCV camera reader.")
+            scene_info = sceneLoadTypeCallbacks["OmniScene"](
+                args.source_path, args.white_background, args.eval
+            )
+        elif os.path.exists(os.path.join(args.source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
@@ -62,7 +81,7 @@ class Scene:
             with open(os.path.join(self.model_path, "cameras.json"), 'w') as file:
                 json.dump(json_cams, file)
 
-        if shuffle:
+        if shuffle and not is_omniscene:
             random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
             random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 

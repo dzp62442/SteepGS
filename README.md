@@ -87,7 +87,7 @@ The data downloading and processing are the same with the original 3DGS. Please 
 The simplest way to use and evaluate SteepGS is through the following commands:
 
 ```shell
-python train.py -s <path to COLMAP or NeRF Synthetic dataset> -m <path to checkpoint> --no_gui --densitf_strategy steepest  --eval # Train with train/test split
+python train.py -s <path to COLMAP or NeRF Synthetic dataset> -m <path to checkpoint> --no_gui --densify_strategy steepest  --eval # Train with train/test split
 python render.py -m <path to trained model> # Generate renderings
 python metrics.py -m <path to trained model> # Compute error metrics on renderings
 ```

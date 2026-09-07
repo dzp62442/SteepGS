@@ -37,6 +37,7 @@ from scene.dataset_readers import (
 from scripts.run_omniscene import (
     _ensure_result_protocol,
     _prepare_if_needed,
+    _refresh_scene_metric_reports,
     _safe_remove_scene_directory,
     _scene_protocol,
     _write_completion,
@@ -457,6 +458,19 @@ def _case_strict_result_completion(tmp_path):
     resumed_arguments = (*arguments[:-1], resumed_protocol)
     valid, reason = validate_scene_result(*resumed_arguments, require_completion=True)
     assert valid, reason
+    timing_paths = [model_path / f"training_time_{iteration}.txt" for iteration in (1, 2)]
+    timing_snapshots = [
+        (path.read_bytes(), path.stat().st_mtime_ns) for path in timing_paths
+    ]
+    assert _refresh_scene_metric_reports(model_path, scene_dir, (1, 2)) == [1, 2]
+    assert "[ALL_18]" in (model_path / "metrics_1.txt").read_text(encoding="utf-8")
+    assert "[NOVEL_12]" in (model_path / "metrics_1.txt").read_text(encoding="utf-8")
+    assert _refresh_scene_metric_reports(model_path, scene_dir, (1, 2)) == []
+    assert [
+        (path.read_bytes(), path.stat().st_mtime_ns) for path in timing_paths
+    ] == timing_snapshots
+    valid, reason = validate_scene_result(*resumed_arguments, require_completion=True)
+    assert valid, reason
     incompatible_protocol = dict(resumed_protocol, bin_token="different-bin")
     valid, _ = validate_scene_result(
         *arguments[:-1], incompatible_protocol, require_completion=True
@@ -488,7 +502,11 @@ def _case_center150_aggregation_is_macro_mean(tmp_path):
         )
     assert summary["sample_count"] == 150
     assert summary["milestones"]["1"]["all_18"]["psnr"] == {"mean": 20.0, "std": 0.0}
+    assert summary["milestones"]["1"]["novel_12"]["psnr"] == {"mean": 19.0, "std": 0.0}
     assert len(summary["samples"]) == 150
+    summary_text = (tmp_path / "center150_metrics_summary.txt").read_text(encoding="utf-8")
+    assert "[ALL_18]" in summary_text
+    assert "[NOVEL_12]" in summary_text
 
 
 class OmniSceneTests(unittest.TestCase):

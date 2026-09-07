@@ -153,11 +153,15 @@ def training(dataset, opt, pipe, logging_intervals, testing_iterations, saving_i
                 omniscene_milestone_counts[str(iteration)] = int(gaussians.get_xyz.shape[0])
                 metrics = omniscene_evaluator.evaluate(iteration, pure_training_seconds)
                 print(
-                    "\n[ITER {}] OmniScene all-18: PSNR {:.7f} SSIM {:.7f} LPIPS {:.7f} TRAIN_TIME {:.3f}s".format(
+                    "\n[ITER {}] OmniScene all-18: PSNR {:.7f} SSIM {:.7f} LPIPS {:.7f} "
+                    "novel-12: PSNR {:.7f} SSIM {:.7f} LPIPS {:.7f} TRAIN_TIME {:.3f}s".format(
                         iteration,
                         metrics["all_18"]["psnr"],
                         metrics["all_18"]["ssim"],
                         metrics["all_18"]["lpips"],
+                        metrics["novel_12"]["psnr"],
+                        metrics["novel_12"]["ssim"],
+                        metrics["novel_12"]["lpips"],
                         pure_training_seconds,
                     )
                 )

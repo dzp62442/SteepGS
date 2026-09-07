@@ -15,11 +15,9 @@ import torch
 from PIL import Image
 
 from lpipsPyTorch.modules.lpips import LPIPS
+from comp_svfgs.metric_reporting import METRIC_NAMES, format_metrics_text
 from utils.image_utils import psnr
 from utils.loss_utils import ssim
-
-
-METRIC_NAMES = ("psnr", "ssim", "lpips")
 
 
 def capture_rng_state() -> Dict[str, Any]:
@@ -172,9 +170,7 @@ class OmniSceneEvaluator:
             _atomic_write_json(self.model_path / f"metrics_{iteration}.json", payload)
             _atomic_write_text(
                 self.model_path / f"metrics_{iteration}.txt",
-                "PSNR: {:.10f}\nSSIM: {:.10f}\nLPIPS: {:.10f}\n".format(
-                    all_metrics["psnr"], all_metrics["ssim"], all_metrics["lpips"]
-                ),
+                format_metrics_text(payload),
             )
             _atomic_write_text(
                 self.model_path / f"training_time_{iteration}.txt",

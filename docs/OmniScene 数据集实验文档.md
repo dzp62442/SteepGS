@@ -358,6 +358,9 @@ python scripts/run_omniscene.py \
   --mode val \
   --iterations 1000 \
   --eval-iterations 1000
+
+# 只刷新已完成实验的逐场景与全局指标报告，不启动 GPU
+python scripts/run_omniscene.py --report-only
 ```
 
 启动器使用当前解释器 `sys.executable` 调用 `train.py`，避免意外使用系统 Python/pip。GPU 通过子进程启动前设置 `CUDA_VISIBLE_DEVICES`，不能等 torch 导入后再切换。
@@ -393,7 +396,7 @@ python scripts/run_omniscene.py \
 - SSIM：`utils.loss_utils.ssim`；
 - LPIPS：`lpipsPyTorch.modules.lpips.LPIPS(net_type="vgg")`。
 
-LPIPS 模型在单场景训练进程中只实例化一次并设为 eval，不按视图重复创建。每个视图保存 PSNR/SSIM/LPIPS；场景主指标为 18 张图的算术平均。另保存前 12 张 novel-only 平均作为诊断项，但正式 Center150 主汇总仍以用户指定的 all-18 指标为准。
+LPIPS 模型在单场景训练进程中只实例化一次并设为 eval，不按视图重复创建。每个视图保存 PSNR/SSIM/LPIPS；每个场景同时报告 18 张 target 的算术平均（all-18）和前 12 张新视角的算术平均（novel-12）。Center150 汇总对两组指标都进行报告。
 
 150 场景汇总采用等场景权重的宏平均，并报告场景间标准差。因为每场景都必须有 18 张视图，all-18 的宏平均数值上也等价于把 2700 张图等权平均；逐场景和逐视图结果仍完整保留，便于追溯。
 
@@ -436,7 +439,7 @@ LPIPS 模型在单场景训练进程中只实例化一次并设为 eval，不按
 
 不创建 `chkpnt*.pth`，也不保存 1k/5k PLY。1k/5k 状态只在同一次训练进程中就地渲染和评估。
 
-JSON 是严格完成检查和后续分析的规范来源，保存逐视图、all-18、novel-12 及协议摘要；同名 TXT 只保存 all-18 的 PSNR/SSIM/LPIPS，便于人工查看并与其它优化式基线的文件命名保持一致。
+JSON 是严格完成检查和后续分析的规范来源，保存逐视图、all-18、novel-12 及协议摘要；同名 TXT 同时保存 all-18 和 novel-12 的 PSNR/SSIM/LPIPS。对于已完成实验，`--report-only` 只根据现有 JSON 刷新逐场景与全局汇总报告，不调用数据预处理或训练，也不重写 `training_time_*.txt`。
 
 ## 11. 完成态、重跑与协议指纹
 

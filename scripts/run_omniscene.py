@@ -40,6 +40,10 @@ from comp_svfgs.omniscene_preprocess import (  # noqa: E402
     preprocess_scene,
     validate_prepared_scene,
 )
+from comp_svfgs.metric_reporting import (  # noqa: E402
+    METRIC_NAMES,
+    format_metrics_text,
+)
 from arguments import ModelParams, OptimizationParams, PipelineParams  # noqa: E402
 
 
@@ -49,7 +53,6 @@ DEFAULT_RESOLUTION = (112, 200)
 DEFAULT_CONFIDENCE_THRESHOLD = 0.3
 PROTOCOL_VERSION = 1
 COMPLETION_VERSION = 1
-METRIC_NAMES = ("psnr", "ssim", "lpips")
 RESERVED_EXTRA_ARGS = {
     "-s", "--source_path", "-m", "--model_path", "-r", "--resolution",
     "--eval", "--no_gui", "--iterations", "--test_iterations", "--save_iterations",
@@ -150,6 +153,7 @@ def _code_identities() -> Dict[str, str]:
         "comp_svfgs/dataset_omniscene.py",
         "comp_svfgs/omniscene_preprocess.py",
         "comp_svfgs/omniscene_evaluation.py",
+        "comp_svfgs/metric_reporting.py",
         "scene/dataset_readers.py",
         "scene/__init__.py",
         "train.py",
@@ -361,17 +365,30 @@ def build_train_command(
     return command
 
 
-def _parse_metrics_text(path: Path) -> Dict[str, float]:
+def _parse_metrics_text(path: Path) -> Dict[str, Dict[str, float]]:
     expected = {"PSNR": "psnr", "SSIM": "ssim", "LPIPS": "lpips"}
-    values: Dict[str, float] = {}
+    groups: Dict[str, Dict[str, float]] = {}
+    current_group = "all_18"
     with path.open("r", encoding="utf-8") as metrics_file:
         for line in metrics_file:
+            stripped = line.strip()
+            if stripped == "[ALL_18]":
+                current_group = "all_18"
+                continue
+            if stripped == "[NOVEL_12]":
+                current_group = "novel_12"
+                continue
             name, separator, value = line.partition(":")
             if separator and name.strip() in expected:
-                values[expected[name.strip()]] = float(value.strip())
-    if set(values) != set(METRIC_NAMES) or not all(math.isfinite(value) for value in values.values()):
+                groups.setdefault(current_group, {})[expected[name.strip()]] = float(value.strip())
+    all_values = groups.get("all_18", {})
+    if set(all_values) != set(METRIC_NAMES) or not all(
+        math.isfinite(value) for values in groups.values() for value in values.values()
+    ):
         raise ValueError(f"Invalid metrics TXT: {path}")
-    return values
+    if "novel_12" in groups and set(groups["novel_12"]) != set(METRIC_NAMES):
+        raise ValueError(f"Incomplete novel-view metrics TXT: {path}")
+    return groups
 
 
 def _parse_training_time(path: Path) -> float:
@@ -452,10 +469,16 @@ def _read_iteration_result(
         for name in METRIC_NAMES:
             if not math.isclose(float(values.get(name)), expected[name], rel_tol=1e-9, abs_tol=1e-9):
                 raise ValueError(f"Metric average mismatch for {group}/{name}: {metrics_path}")
-    text_values = _parse_metrics_text(model_path / f"metrics_{iteration}.txt")
+    text_groups = _parse_metrics_text(model_path / f"metrics_{iteration}.txt")
     for name in METRIC_NAMES:
-        if not math.isclose(text_values[name], expected_all[name], rel_tol=1e-8, abs_tol=1e-8):
-            raise ValueError(f"Metrics JSON/TXT mismatch for {name}: {metrics_path}")
+        if not math.isclose(
+            text_groups["all_18"][name], expected_all[name], rel_tol=1e-8, abs_tol=1e-8
+        ):
+            raise ValueError(f"Metrics JSON/TXT mismatch for all_18/{name}: {metrics_path}")
+        if "novel_12" in text_groups and not math.isclose(
+            text_groups["novel_12"][name], expected_novel[name], rel_tol=1e-8, abs_tol=1e-8
+        ):
+            raise ValueError(f"Metrics JSON/TXT mismatch for novel_12/{name}: {metrics_path}")
     training_time = _parse_training_time(model_path / f"training_time_{iteration}.txt")
     if not math.isclose(
         training_time, float(metrics.get("training_time_seconds")), rel_tol=1e-8, abs_tol=1e-8
@@ -485,7 +508,6 @@ def _result_artifacts(model_path: Path, iterations: int, eval_iterations: Sequen
         paths.extend(
             [
                 model_path / f"metrics_{iteration}.json",
-                model_path / f"metrics_{iteration}.txt",
                 model_path / f"training_time_{iteration}.txt",
             ]
         )
@@ -493,6 +515,28 @@ def _result_artifacts(model_path: Path, iterations: int, eval_iterations: Sequen
         paths.extend(sorted((model_path / "test" / f"ours_{iteration}" / "gt").glob("*.png")))
     paths.append(model_path / "point_cloud" / f"iteration_{iterations}" / "point_cloud.ply")
     return paths
+
+
+def _is_metrics_text_artifact(identity: Any) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    name = Path(str(identity.get("path", ""))).name
+    return name.startswith("metrics_") and name.endswith(".txt") and name[8:-4].isdigit()
+
+
+def _refresh_scene_metric_reports(
+    model_path: Path, scene_dir: Path, eval_iterations: Sequence[int]
+) -> List[int]:
+    """Refresh derived TXT reports only; never rewrite JSON or timing files."""
+    changed = []
+    for iteration in eval_iterations:
+        metrics = _read_iteration_result(model_path, scene_dir, iteration)
+        path = model_path / f"metrics_{iteration}.txt"
+        content = format_metrics_text(metrics)
+        if path.read_text(encoding="utf-8") != content:
+            _atomic_write_text(path, content)
+            changed.append(iteration)
+    return changed
 
 
 def _artifact_manifest(
@@ -574,8 +618,20 @@ def validate_scene_result(
             if completion.get("protocol_fingerprint") != protocol.get("fingerprint"):
                 return False, "completion marker does not match its recorded scene protocol"
             artifact_manifest = _artifact_manifest(model_path, iterations, eval_iterations)
-            if completion.get("artifact_fingerprint") != _canonical_sha256(artifact_manifest):
+            recorded_artifacts = completion.get("artifacts")
+            if not isinstance(recorded_artifacts, list):
+                return False, "completion marker lacks its artifact manifest"
+            # Version-1 markers included metrics_*.txt. Those reports are now
+            # regenerable from metrics JSON, so ignore only those legacy entries.
+            recorded_artifacts = [
+                identity for identity in recorded_artifacts
+                if isinstance(identity, dict) and not _is_metrics_text_artifact(identity)
+            ]
+            if recorded_artifacts != artifact_manifest:
                 return False, "completion artifact fingerprint mismatch"
+            if not any(_is_metrics_text_artifact(identity) for identity in completion["artifacts"]):
+                if completion.get("artifact_fingerprint") != _canonical_sha256(artifact_manifest):
+                    return False, "completion artifact fingerprint mismatch"
         return True, "complete"
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         return False, str(exc)
@@ -708,6 +764,9 @@ def _run_scene(
             expected_protocol, require_completion=True,
         )
         if complete:
+            refreshed = _refresh_scene_metric_reports(final_path, scene_dir, eval_iterations)
+            if refreshed:
+                print(f"[REPORT] refreshed {scene_name}: {refreshed}", flush=True)
             print(f"[SKIP] complete scene: {scene_name}", flush=True)
             return scene_name, token, scene_dir, final_path
         print(f"[RESTART] incomplete scene {scene_name}: {reason}", flush=True)
@@ -722,6 +781,9 @@ def _run_scene(
         scene_protocol, require_completion=True,
     )
     if complete:
+        refreshed = _refresh_scene_metric_reports(final_path, scene_dir, eval_iterations)
+        if refreshed:
+            print(f"[REPORT] refreshed {scene_name}: {refreshed}", flush=True)
         print(f"[SKIP] complete scene: {scene_name}", flush=True)
         return scene_name, token, scene_dir, final_path
 
@@ -768,6 +830,41 @@ def _run_scene(
     os.replace(str(work_path), str(final_path))
     print(f"[DONE] {scene_name}", flush=True)
     return scene_name, token, scene_dir, final_path
+
+
+def _collect_completed_scene_for_reporting(
+    dataset: OmniSceneDataset,
+    index: int,
+    prepared_root: Path,
+    experiment_root: Path,
+    global_protocol: Dict[str, Any],
+    confidence_threshold: float,
+    iterations: int,
+    eval_iterations: Sequence[int],
+) -> Tuple[str, str, Path, Path]:
+    """Collect and refresh one completed scene without a training fallback."""
+    token = dataset.bin_tokens[index]
+    scene_name = f"{index + 1:03d}_{token}"
+    scene_dir = prepared_root / scene_name
+    model_path = experiment_root / scene_name
+    try:
+        scene_protocol = _scene_protocol(global_protocol, scene_dir, scene_name, token)
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot report incomplete scene {scene_name}: {exc}") from exc
+    complete, reason = validate_scene_result(
+        model_path, scene_dir, token, index, tuple(global_protocol["resolution"]),
+        confidence_threshold, dataset.split_sha256, iterations, eval_iterations,
+        scene_protocol, require_completion=True,
+    )
+    if not complete:
+        raise RuntimeError(f"Cannot report incomplete scene {scene_name}: {reason}")
+    refreshed = _refresh_scene_metric_reports(model_path, scene_dir, eval_iterations)
+    print(
+        f"[REPORT] {scene_name}: "
+        + (f"refreshed {refreshed}" if refreshed else "already current"),
+        flush=True,
+    )
+    return scene_name, token, scene_dir, model_path
 
 
 def aggregate_center150_results(
@@ -839,9 +936,11 @@ def aggregate_center150_results(
     for iteration in eval_iterations:
         result = milestones[str(iteration)]
         lines.append(f"Iteration {iteration}")
-        for name in METRIC_NAMES:
-            item = result["all_18"][name]
-            lines.append(f"{name.upper()}: {item['mean']:.7f} (std {item['std']:.7f})")
+        for group, label in (("all_18", "ALL_18"), ("novel_12", "NOVEL_12")):
+            lines.append(f"[{label}]")
+            for name in METRIC_NAMES:
+                item = result[group][name]
+                lines.append(f"{name.upper()}: {item['mean']:.7f} (std {item['std']:.7f})")
         timing = result["training_time_seconds"]
         lines.append(
             f"TRAINING_TIME_SECONDS: {timing['mean']:.7f} (std {timing['std']:.7f})"
@@ -894,6 +993,10 @@ def main() -> None:
     parser.add_argument("--confidence-threshold", type=float, default=DEFAULT_CONFIDENCE_THRESHOLD)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gpu", default="0")
+    parser.add_argument(
+        "--report-only", action="store_true",
+        help="Refresh metrics reports from completed results; never preprocess or train",
+    )
     parser.add_argument("--preprocessed-root", type=Path, default=REPO_ROOT / "output" / "omniscene_preprocessed")
     parser.add_argument("--result-root", type=Path, default=REPO_ROOT / "output" / "omniscene_results")
     parser.add_argument(
@@ -928,14 +1031,25 @@ def main() -> None:
         prepared_tag += f"_conf{args.confidence_threshold:g}"
     prepared_root = (args.preprocessed_root / prepared_tag).resolve()
     experiment_root = (args.result_root / tag).resolve()
-    prepared_root.mkdir(parents=True, exist_ok=True)
-    experiment_root.mkdir(parents=True, exist_ok=True)
+    if args.report_only:
+        if not prepared_root.is_dir() or not experiment_root.is_dir():
+            raise RuntimeError(
+                "--report-only requires existing preprocessed and completed result directories"
+            )
+    else:
+        prepared_root.mkdir(parents=True, exist_ok=True)
+        experiment_root.mkdir(parents=True, exist_ok=True)
 
     protocol = build_protocol(
         dataset, args.resolution, args.confidence_threshold, args.iterations,
         eval_iterations, args.seed, args.extra_train_args,
     )
-    _write_preprocess_protocol(prepared_root / "protocol.json", protocol)
+    if not args.report_only:
+        _write_preprocess_protocol(prepared_root / "protocol.json", protocol)
+    elif not (prepared_root / "protocol.json").is_file():
+        raise RuntimeError("--report-only requires an existing preprocessing protocol")
+    if args.report_only and not (experiment_root / "protocol.json").is_file():
+        raise RuntimeError("--report-only requires an existing result protocol")
     _ensure_result_protocol(experiment_root / "protocol.json", protocol)
 
     all_indices = list(range(len(dataset)))
@@ -950,11 +1064,17 @@ def main() -> None:
 
     records_by_index: Dict[int, Tuple[str, str, Path, Path]] = {}
     for index in selected_indices:
-        record = _run_scene(
-            dataset, index, prepared_root, experiment_root, protocol,
-            args.confidence_threshold, args.iterations, eval_iterations,
-            args.seed, args.gpu, args.extra_train_args,
-        )
+        if args.report_only:
+            record = _collect_completed_scene_for_reporting(
+                dataset, index, prepared_root, experiment_root, protocol,
+                args.confidence_threshold, args.iterations, eval_iterations,
+            )
+        else:
+            record = _run_scene(
+                dataset, index, prepared_root, experiment_root, protocol,
+                args.confidence_threshold, args.iterations, eval_iterations,
+                args.seed, args.gpu, args.extra_train_args,
+            )
         records_by_index[index] = record
 
     if args.mode == "center150" and selected_indices == all_indices:
